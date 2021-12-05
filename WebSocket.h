@@ -160,6 +160,13 @@ namespace IDFix
                 {
                     WebSocketAction action;          /**< The action to be enqued */
                     uint32_t        delay = {0};     /**< Optinal a delay time in milliseconds */
+
+                };
+
+                struct SendMessageEvent
+                {
+                    uint32_t        length;
+                    const char*     data;
                 };
 
                 enum class WebSocketState
@@ -204,9 +211,15 @@ namespace IDFix
                 void            connectTransport(void);
 
                 /**
-                 * @brief Wait for an event on the internal queue and process it
+                 * @brief Wait for an websocket event on the internal queue and process it
                  */
-                void            waitForEvent(void);
+                void            waitForWebsocketEvent(void);
+
+                /**
+                * @brief Wait for an sendMessage event on the internal queue and process it
+                */
+
+                void            waitForSendMessageEvent(void);
 
                 /**
                  * @brief Read available data from the idf transport stream
@@ -246,7 +259,8 @@ namespace IDFix
                 Mutex                           _stateMutex;
 
                 WebSocketEventHandler*          _eventHandler = {};
-                QueueHandle_t                   _eventQueue = { nullptr };
+                QueueHandle_t                   _webSocketEventQueue = { nullptr };
+                QueueHandle_t                   _sendMessageEventQueue = { nullptr };
 
                 const char*                     _websocketCert = { nullptr };
                 int                             _bufferSize;

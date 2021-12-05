@@ -34,7 +34,7 @@ namespace
     const int       WEBSOCKET_SSL_DEFAULT_PORT      = 443;
     const int       WEBSOCKET_BUFFER_SIZE           = 1024;
     const int       WEBSOCKET_NETWORK_TIMEOUT       = 5*1000; // ms
-    const int       TRANSPORT_POLL_TIMEOUT          = 1000; // ms
+    const int       TRANSPORT_POLL_TIMEOUT          = 800; // ms
 }
 
 namespace IDFix
@@ -79,8 +79,11 @@ namespace IDFix
             {
                 MutexLocker websocketLocker(_websocketMutex);
 
-                _eventQueue = xQueueCreate( 1, sizeof( WebSocketEvent ) );
-                if ( !_eventQueue )
+                _webSocketEventQueue = xQueueCreate(1, sizeof( WebSocketEvent ) );
+                _sendMessageEventQueue = xQueueCreate(4, sizeof( SendMessageEvent ));
+
+
+                if ( !_webSocketEventQueue || ! _sendMessageEventQueue)
                 {
                     ESP_LOGE(LOG_TAG, "Error create event queue");
                     return false;
@@ -141,7 +144,7 @@ namespace IDFix
                 WebSocketEvent  event;
                 event.action = WebSocketAction::Stop;
 
-                if ( xQueueSend(_eventQueue, &event, 0) != pdPASS )
+                if ( xQueueSend(_webSocketEventQueue, &event, 0) != pdPASS )
                 {
                     ESP_LOGE(LOG_TAG, "Failed to queue Stop event!");
                     return false;
@@ -176,10 +179,16 @@ namespace IDFix
                 delete [] _txBuffer;
             }
 
-            if ( _eventQueue )
+            if ( _webSocketEventQueue )
             {
-                vQueueDelete(_eventQueue);
-                _eventQueue = nullptr;
+                vQueueDelete(_webSocketEventQueue);
+                _webSocketEventQueue = nullptr;
+            }
+
+            if ( _sendMessageEventQueue )
+            {
+                vQueueDelete(_sendMessageEventQueue);
+                _sendMessageEventQueue = nullptr;
             }
         }
 
@@ -265,7 +274,7 @@ namespace IDFix
                 event.action    = WebSocketAction::Connect;
                 event.delay     = delayTime;
 
-                if ( xQueueSend(_eventQueue, &event, 0) != pdPASS )
+                if ( xQueueSend(_webSocketEventQueue, &event, 0) != pdPASS )
                 {
                     ESP_LOGW(LOG_TAG, "Failed to queue Connect event!");
                     return false;
@@ -299,7 +308,7 @@ namespace IDFix
                 WebSocketEvent  event;
                 event.action = WebSocketAction::Disconnect;
 
-                if ( xQueueSend(_eventQueue, &event, 0) != pdPASS )
+                if ( xQueueSend(_webSocketEventQueue, &event, 0) != pdPASS )
                 {
                     ESP_LOGW(LOG_TAG, "Failed to queue Disconnect event!");
                     return false;
@@ -380,7 +389,6 @@ namespace IDFix
                     needWrite = len - writeIndex;
                 }
             _websocketMutex.unlock();
-
             return writeIndex;
         }
 
@@ -391,18 +399,46 @@ namespace IDFix
                 return -1;
             }
 
-            return sendWithOpcode(WS_TRANSPORT_OPCODES_TEXT, message.c_str(), static_cast<int>( message.length() ), _networkTimeoutMS);
+            SendMessageEvent  event;
+
+            const char* cstring = message.c_str();
+
+            char *myItem = (char*) malloc(strlen(cstring)+1);
+            strcpy(myItem, cstring);
+            event.data = myItem;
+            event.length = static_cast<int>( message.length());
+
+            if ( xQueueSend(_sendMessageEventQueue, &event, 0) != pdPASS )
+            {
+                ESP_LOGE(LOG_TAG, "Failed to queue Message event!");
+                free((void*) event.data);
+                return false;
+            }
+            return true;
         }
 
         int WebSocket::sendBinaryMessage(const char *data, int length)
         {
             if ( getWebsocketState() != WebSocketState::Connected )
             {
+                ESP_LOGE(LOG_TAG, "Failed to enqueue message. Not connected.");
                 return -1;
             }
 
-            //ESP_LOGV(LOG_TAG, "sendBinaryMessage: %s - running in task: %s", std::string(data, length).c_str(), Task::getRunningTaskName().c_str() );
-            return sendWithOpcode(WS_TRANSPORT_OPCODES_BINARY, data, length, _networkTimeoutMS);
+            SendMessageEvent  event;
+
+            char *myItem = (char*) malloc(strlen(data)+1);
+            strcpy(myItem, data);
+            event.data = myItem;
+            event.length = length;
+
+            if ( xQueueSend(_sendMessageEventQueue, &event, 0) != pdPASS )
+            {
+                ESP_LOGE(LOG_TAG, "Failed to queue Stop event!");
+                free((void*) event.data);
+                return false;
+            }
+            return true;
         }
 
         void WebSocket::run()
@@ -414,8 +450,7 @@ namespace IDFix
                 switch (_websocketState)
                 {
                     case WebSocketState::Idle:
-
-                        waitForEvent();
+                        waitForWebsocketEvent();
                         break;
 
                     case WebSocketState::Stopping:
@@ -439,6 +474,7 @@ namespace IDFix
                     case WebSocketState::Connected:
 
                         {
+                            waitForSendMessageEvent();
                             _websocketMutex.lock();
                                 int readSelect = esp_transport_poll_read(_websocketTransport, TRANSPORT_POLL_TIMEOUT);
                             _websocketMutex.unlock();
@@ -652,11 +688,21 @@ namespace IDFix
             }
         }
 
-        void WebSocket::waitForEvent()
+        void WebSocket::waitForSendMessageEvent()
+        {
+            SendMessageEvent event;
+            while ( xQueueReceive(_sendMessageEventQueue, &event, 0) == pdTRUE ){
+                ESP_LOGV(LOG_TAG, "Message dequeued");
+                sendWithOpcode(WS_TRANSPORT_OPCODES_BINARY, event.data, event.length, _networkTimeoutMS);
+                free((void*) event.data);
+            }
+        }
+
+
+        void WebSocket::waitForWebsocketEvent()
         {
             WebSocketEvent event;
-
-            if( xQueuePeek(_eventQueue, &event, portMAX_DELAY) == pdTRUE )
+            if( xQueuePeek(_webSocketEventQueue, &event, portMAX_DELAY) == pdTRUE )
             {
                 switch (event.action)
                 {
@@ -667,7 +713,7 @@ namespace IDFix
                         setWebsocketState(WebSocketState::Connecting);
 
                         // now we remove the event from the queue (e.g. clear the queue)
-                        xQueueReset(_eventQueue);
+                        xQueueReset(_webSocketEventQueue);
 
                         if ( event.delay > 0 )
                         {
@@ -680,19 +726,11 @@ namespace IDFix
                     case WebSocketAction::Stop:
 
                         setWebsocketState(WebSocketState::Stopping);
-                        xQueueReset(_eventQueue);
-
+                        xQueueReset(_webSocketEventQueue);
                         break;
 
-                    default:
-
-                        break;
+                    default: break;
                 }
-
-            }
-            else
-            {
-                ESP_LOGW(LOG_TAG, "waitForEvent: xQueuePeek timeout!");
             }
         }
 
@@ -805,7 +843,7 @@ namespace IDFix
             _websocketMutex.unlock();
 
             setWebsocketState(WebSocketState::Idle);
-            xQueueReset(_eventQueue);
+            xQueueReset(_webSocketEventQueue);
 
             if ( _eventHandler )
             {
@@ -817,17 +855,16 @@ namespace IDFix
         {
             WebSocketEvent event;
 
-            if( xQueuePeek(_eventQueue, &event, 0) == pdTRUE )
+            if( xQueuePeek(_webSocketEventQueue, &event, 0) == pdTRUE )
             {
                 switch (event.action)
                 {
                     case WebSocketAction::Disconnect:
 
                         ESP_LOGI(LOG_TAG, "Received queued disconnect event");
-                        xQueueReset(_eventQueue);
-
+                        xQueueReset(_sendMessageEventQueue);
+                        xQueueReset(_webSocketEventQueue);
                         abortConnection();
-
                         break;
 
                     default:
